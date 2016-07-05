@@ -1,0 +1,303 @@
+#!/usr/bin/env ruby
+
+require 'zlib'
+require 'stringio'
+require 'yaml'
+
+SECTOR_BYTES = 4096
+COMPRESS_ZLIB = 2
+
+class Object
+
+  def readshort
+    read(2).unpack('s>').first
+  end
+
+  def readint
+    read(4).unpack('l>').first
+  end
+
+  def readlong
+    read(8).unpack('q>').first
+  end
+
+  def readfloat
+    read(4).unpack('g').first
+  end
+
+  def readdouble
+    read(8).unpack('G').first
+  end
+
+  def writebyte(n)
+    write n.chr
+  end
+
+  def writeshort(n)
+    write [n].pack('s>')
+  end
+    
+  def writeint(n)
+    write [n].pack('l>')
+  end
+
+  def writelong(n)
+    write [n].pack('q>')
+  end
+
+  def writefloat(n)
+    write [n].pack('g')
+  end
+
+  def writedouble(n)
+    write [n].pack('G')
+  end
+end
+
+class TagPayload
+  TYPES = [ :TAG_End, :TAG_Byte, :TAG_Short, :TAG_Int, :TAG_Long, :TAG_Float, :TAG_Double, :TAG_Byte_Array, :TAG_String, :TAG_List, :TAG_Compound, :TAG_Int_Array ]
+
+  attr_accessor :value
+  attr_reader :list
+  attr_reader :children
+
+  def initialize(data, type)
+    case type
+
+    when :TAG_Byte
+      @value = data.readbyte
+
+    when :TAG_Short
+      @value = data.readshort
+
+    when :TAG_Int
+      @value = data.readint
+
+    when :TAG_Long
+      @value = data.readlong
+
+    when :TAG_Float
+      @value = data.readfloat
+
+    when :TAG_Double
+      @value = data.readdouble
+
+    when :TAG_Byte_Array
+      length = data.readint
+      @array = []
+      length.times do
+        @array.push(data.readbyte)
+      end
+
+    when :TAG_String
+      length = data.readshort
+      @value = data.read(length) 
+
+    when :TAG_List
+      @list_type = TYPES[data.readbyte]
+      length = data.readint
+      @list = []
+      length.times do
+        @list.push(TagPayload.new(data, @list_type))
+      end
+
+    when :TAG_Compound
+      @children = []
+      begin 
+        @children.push(Tag.new(data))
+      end until @children.last.type == :TAG_End
+
+    when :TAG_Int_Array
+      length = data.readint
+      @array = []
+      length.times do
+        @array.push(data.readint)
+      end
+
+    else
+      abort("don't know how to handle #{type.to_s}")
+
+    end
+  end
+
+  def child(name)
+    @children or return nil
+    return @children.detect { |c| c.name == name } 
+  end
+
+  def pack(type)
+    data = StringIO.new
+    data.set_encoding(Encoding::ASCII_8BIT)
+
+    case type
+
+    when :TAG_Byte
+      data.writebyte(@value)
+
+    when :TAG_Short
+      data.writeshort(@value)
+
+    when :TAG_Int
+      data.writeint(@value)
+
+    when :TAG_Long
+      data.writelong(@value)
+
+    when :TAG_Float
+      data.writefloat(@value)
+
+    when :TAG_Double
+      data.writedouble(@value)
+
+    when :TAG_Byte_Array
+      data.writeint(@array.length)
+      @array.each do |n|
+        data.writebyte(n)
+      end
+
+    when :TAG_String
+      data.writeshort(@value.length)
+      data.write(@value) 
+
+    when :TAG_List
+      data.writebyte(TYPES.index(@list_type))
+      data.writeint(@list.length)
+      @list.each do |n|
+        data.write(n.pack(@list_type))
+      end
+
+    when :TAG_Compound
+      @children.each do |n|
+        data.write(n.pack)
+      end
+
+    when :TAG_Int_Array
+      data.writeint(@array.length)
+      @array.each do |n|
+        data.writeint(n)
+      end
+
+    else
+      abort("don't know how to handle #{type.to_s}")
+
+    end
+
+    return data.string
+  end
+    
+end
+
+class Tag < TagPayload
+  attr_reader :type 
+  attr_reader :name 
+
+  def initialize(data)
+    id = data.readbyte
+    id > TYPES.length and abort("unknown id #{id}")
+    @type = TYPES[id]
+    @type == :TAG_End and return
+
+    name_length = data.readshort
+    @name = data.read(name_length)
+    super(data, @type)
+  end
+
+  def pack
+    data = StringIO.new
+    data.set_encoding(Encoding::ASCII_8BIT)
+
+    data.writebyte(TYPES.index(@type))
+    if @type != :TAG_End
+      data.writeshort(@name.length)
+      data.write(@name)
+      data.write(super(@type))
+    end
+    return data.string
+  end
+
+end
+
+ARGV.empty? and abort('no fs given')
+
+ARGV.each do |filename|
+  puts filename
+  chunks = []
+  File.open(filename, 'rb') do |f|
+
+    1024.times do |i|
+      location = f.readint
+      offset, sectors = (location & 0xFFFFFF00) >> 8, location & 0xFF
+      chunks.push({ offset: offset, sectors: sectors })
+    end
+
+    1024.times do |i|
+      timestamp = Time.at(f.readint)
+      chunks[i].merge!({ timestamp: timestamp })
+    end
+
+    chunks.each do |c|
+      c[:offset] == 0 and next
+
+      f.pos = c[:offset] * SECTOR_BYTES
+      c[:length] = f.readint
+
+      compress = f.readbyte 
+      compress == COMPRESS_ZLIB or abort("chunk data not zlib (#{compress})")
+    
+      c[:root] = Tag.new(StringIO.open(Zlib::Inflate.inflate(f.read(c[:length] - 1))))
+
+      c[:root].child('Level').child('TileEntities').list.each do |e|
+        e.child('id').value == 'Sign' && e.child('Text1').value[1] == '#' or next
+        e.child('Text1').value = e.child('Text1').value.insert(1, '#') 
+      end
+    end
+
+  end
+  
+  regiondata = StringIO.new
+  regiondata.set_encoding(Encoding::ASCII_8BIT)
+
+  chunks.sort_by { |c| c[:offset] }.each do |c|
+    c[:offset] == 0 and next
+
+    new_offset = regiondata.pos / SECTOR_BYTES + 2
+    if (new_offset < c[:offset])
+      # if the old offset was greater, reuse it
+      puts "bumping offset from #{new_offset} to #{c[:offset]}"
+      regiondata.pos = (c[:offset] - 2) * SECTOR_BYTES
+      new_offset = c[:offset]
+    end
+
+    cdata = Zlib::Deflate.deflate(c[:root].pack)
+    new_length = cdata.length + 1
+    new_sectors = ((5 + new_length).to_f / SECTOR_BYTES).ceil # 4 byte length + at least 1 byte padding
+
+    regiondata.writeint(new_length)
+    regiondata.writebyte(COMPRESS_ZLIB)
+    regiondata.write(cdata)
+    regiondata.pos = (regiondata.pos.to_f / SECTOR_BYTES).ceil * SECTOR_BYTES
+
+    if [new_offset, new_sectors, new_length] != [c[:offset], c[:sectors], c[:length]]
+      puts "offset, sectors, length changed from #{[c[:offset], c[:sectors], c[:length]]} to #{[new_offset, new_sectors, new_length]}"
+      c[:offset] = new_offset
+      c[:sectors] = new_sectors
+    end
+  end
+
+  File.open(filename + '.new', 'wb') do |f|
+
+    chunks.each do |c|
+      location = c[:offset] << 8 | c[:sectors]
+      f.writeint(location)
+    end
+
+    chunks.each do |c|
+      f.writeint(c[:timestamp].to_i)
+    end
+
+    f.write(regiondata.string.ljust(regiondata.pos, 0.chr))
+
+  end
+
+end
+
