@@ -1,0 +1,211 @@
+#!/usr/bin/env ruby
+
+require 'zlib'
+require 'yaml'
+
+class Object
+
+  def readshort
+    read(2).unpack('s>').first
+  end
+
+  def readint
+    read(4).unpack('l>').first
+  end
+
+  def readlong
+    read(8).unpack('q>').first
+  end
+
+  def readfloat
+    read(4).unpack('g').first
+  end
+
+  def readdouble
+    read(8).unpack('G').first
+  end
+
+  def writebyte(n)
+    write n.chr
+  end
+
+  def writeshort(n)
+    write [n].pack('s>')
+  end
+
+  def writeint(n)
+    write [n].pack('l>')
+  end
+
+  def writelong(n)
+    write [n].pack('q>')
+  end
+
+  def writefloat(n)
+    write [n].pack('g')
+  end
+
+  def writedouble(n)
+    write [n].pack('G')
+  end
+
+end
+
+
+class Tag
+  TYPES = [ :TAG_End, :TAG_Byte, :TAG_Short, :TAG_Int, :TAG_Long, :TAG_Float, :TAG_Double, :TAG_Byte_Array, :TAG_String, :TAG_List, :TAG_Compound, :TAG_Int_Array ]
+
+  attr_reader :type
+
+  def initialize(io)
+    @type = TYPES[io.readbyte]
+    @type == :TAG_End and return
+
+    name_length = io.readshort
+    @name = io.read(name_length)
+    @value = self.class.parsePayload(io, type)
+  end
+
+  def self.parsePayload(io, type)
+    case type
+
+    when :TAG_Byte
+      io.readbyte
+
+    when :TAG_Short
+      io.readshort
+
+    when :TAG_Int
+      io.readint
+
+    when :TAG_Long
+      io.readlong
+
+    when :TAG_Float
+      io.readfloat
+
+    when :TAG_Double
+      io.readdouble
+
+    when :TAG_Byte_Array
+      length = io.readint
+      array = []
+      length.times do
+        array.push(io.readbyte)
+      end
+      array
+
+    when :TAG_String
+      length = io.readshort
+      io.read(length).force_encoding(Encoding::UTF_8) 
+
+    when :TAG_List
+      list_type = TYPES[io.readbyte]
+      length = io.readint
+      list = []
+      length.times do
+        list.push(parsePayload(io, list_type))
+      end
+      list
+
+    when :TAG_Compound
+      compound = []
+      begin 
+        compound.push(Tag.new(io))
+      end until compound.last.type == :TAG_End
+      compound.pop
+      compound
+
+    when :TAG_Int_Array
+      length = io.readint
+      array = []
+      length.times do
+        array.push(io.readint)
+      end
+      array
+
+    else
+      raise(NotImplementedError, "what's #{type.to_s} preciousss")
+
+    end
+  end
+
+  def child(name)
+    @type == :TAG_Compound or raise("trying to get child of non-compound")
+    return @value.detect { |c| c.name == name } 
+  end
+
+  def pack(type)
+    io = StringIO.new
+    io.set_encoding(Encoding::ASCII_8BIT)
+
+    case type
+
+    when :TAG_Byte
+      io.writebyte(@value)
+
+    when :TAG_Short
+      io.writeshort(@value)
+
+    when :TAG_Int
+      io.writeint(@value)
+
+    when :TAG_Long
+      io.writelong(@value)
+
+    when :TAG_Float
+      io.writefloat(@value)
+
+    when :TAG_Double
+      io.writedouble(@value)
+
+    when :TAG_Byte_Array
+      io.writeint(@value.length)
+      @value.each do |n|
+        io.writebyte(n)
+      end
+
+    when :TAG_String
+      io.writeshort(@value.length)
+      io.write(@value) 
+
+    when :TAG_List
+      io.writebyte(TYPES.index(@value.first.type))
+      io.writeint(@value.length)
+      @value.each do |n|
+        io.write(n.pack(n.type))
+      end
+
+    when :TAG_Compound
+      @value.each do |n|
+        io.write(n.pack)
+      end
+
+    when :TAG_Int_Array
+      io.writeint(@value.length)
+      @value.each do |n|
+        io.writeint(n)
+      end
+
+    else
+      raise(NotImplementedError, "what's #{type.to_s} preciousss")
+
+    end
+
+    io.string
+  end
+   
+  def encode_with(coder)
+    coder.represent_map(nil, {"#{@type[4..-1].upcase} '#{@name}'" => @value})
+  end 
+end
+
+ARGV.length == 1 or raise(ArgumentError, "gimme one NBT file")
+
+filename = ARGV.first
+Zlib::GzipReader.open(filename) do |gz|
+  root = Tag.new(gz)
+  puts root.to_yaml
+end
+
+

@@ -1,0 +1,225 @@
+#!/usr/bin/env ruby
+
+require 'zlib'
+require 'stringio'
+require 'yaml'
+
+class Object
+
+  def readshort
+    read(2).unpack('s>').first
+  end
+
+  def readint
+    read(4).unpack('l>').first
+  end
+
+  def readlong
+    read(8).unpack('q>').first
+  end
+
+  def readfloat
+    read(4).unpack('g').first
+  end
+
+  def readdouble
+    read(8).unpack('G').first
+  end
+
+  def writebyte(n)
+    write n.chr
+  end
+
+  def writeshort(n)
+    write [n].pack('s>')
+  end
+    
+  def writeint(n)
+    write [n].pack('l>')
+  end
+
+  def writelong(n)
+    write [n].pack('q>')
+  end
+
+  def writefloat(n)
+    write [n].pack('g')
+  end
+
+  def writedouble(n)
+    write [n].pack('G')
+  end
+end
+
+class TagPayload
+  TYPES = [ :TAG_End, :TAG_Byte, :TAG_Short, :TAG_Int, :TAG_Long, :TAG_Float, :TAG_Double, :TAG_Byte_Array, :TAG_String, :TAG_List, :TAG_Compound, :TAG_Int_Array ]
+
+  attr_accessor :value
+  attr_reader :list
+  attr_reader :children
+
+  def initialize(data, type)
+    case type
+
+    when :TAG_Byte
+      @value = data.readbyte
+
+    when :TAG_Short
+      @value = data.readshort
+
+    when :TAG_Int
+      @value = data.readint
+
+    when :TAG_Long
+      @value = data.readlong
+
+    when :TAG_Float
+      @value = data.readfloat
+
+    when :TAG_Double
+      @value = data.readdouble
+
+    when :TAG_Byte_Array
+      length = data.readint
+      @array = []
+      length.times do
+        @array.push(data.readbyte)
+      end
+
+    when :TAG_String
+      length = data.readshort
+      @value = data.read(length) 
+
+    when :TAG_List
+      @list_type = TYPES[data.readbyte]
+      length = data.readint
+      @list = []
+      length.times do
+        @list.push(TagPayload.new(data, @list_type))
+      end
+
+    when :TAG_Compound
+      @children = []
+      begin 
+        @children.push(Tag.new(data))
+      end until @children.last.type == :TAG_End
+
+    when :TAG_Int_Array
+      length = data.readint
+      @array = []
+      length.times do
+        @array.push(data.readint)
+      end
+
+    else
+      abort("don't know how to handle #{type.to_s}")
+
+    end
+  end
+
+  def child(name)
+    @children or return nil
+    return @children.detect { |c| c.name == name } 
+  end
+
+  def pack(type)
+    data = StringIO.new
+    data.set_encoding(Encoding::ASCII_8BIT)
+
+    case type
+
+    when :TAG_Byte
+      data.writebyte(@value)
+
+    when :TAG_Short
+      data.writeshort(@value)
+
+    when :TAG_Int
+      data.writeint(@value)
+
+    when :TAG_Long
+      data.writelong(@value)
+
+    when :TAG_Float
+      data.writefloat(@value)
+
+    when :TAG_Double
+      data.writedouble(@value)
+
+    when :TAG_Byte_Array
+      data.writeint(@array.length)
+      @array.each do |n|
+        data.writebyte(n)
+      end
+
+    when :TAG_String
+      data.writeshort(@value.length)
+      data.write(@value) 
+
+    when :TAG_List
+      data.writebyte(TYPES.index(@list_type))
+      data.writeint(@list.length)
+      @list.each do |n|
+        data.write(n.pack(@list_type))
+      end
+
+    when :TAG_Compound
+      @children.each do |n|
+        data.write(n.pack)
+      end
+
+    when :TAG_Int_Array
+      data.writeint(@array.length)
+      @array.each do |n|
+        data.writeint(n)
+      end
+
+    else
+      abort("don't know how to handle #{type.to_s}")
+
+    end
+
+    return data.string
+  end
+    
+end
+
+class Tag < TagPayload
+  attr_reader :type 
+  attr_reader :name 
+
+  def initialize(data)
+    id = data.readbyte
+    id > TYPES.length and abort("unknown id #{id}")
+    @type = TYPES[id]
+    @type == :TAG_End and return
+
+    name_length = data.readshort
+    @name = data.read(name_length)
+    super(data, @type)
+  end
+
+  def pack
+    data = StringIO.new
+    data.set_encoding(Encoding::ASCII_8BIT)
+
+    data.writebyte(TYPES.index(@type))
+    if @type != :TAG_End
+      data.writeshort(@name.length)
+      data.write(@name)
+      data.write(super(@type))
+    end
+    return data.string
+  end
+
+end
+
+ARGV.length != 1 and abort('gimme exactly 1 level.dat')
+
+filename = ARGV.first
+Zlib::GzipReader.open(filename) do |gz|
+  root = Tag.new(gz)
+  puts root.to_yaml
+end
+
+
